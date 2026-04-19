@@ -164,6 +164,144 @@ pub const RELAY_PORT: i32 = 21117;
 pub const WS_RENDEZVOUS_PORT: i32 = 21118;
 pub const WS_RELAY_PORT: i32 = 21119;
 
+fn extract_server_host(server: &str) -> String {
+    let server = server.trim();
+    if server.is_empty() {
+        return String::new();
+    }
+    let server = server
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(server);
+    let server = server
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let server = server
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(server);
+    if server.is_empty() {
+        return String::new();
+    }
+    if let Some(rest) = server.strip_prefix('[') {
+        if let Some((host, _)) = rest.split_once(']') {
+            return host.to_ascii_lowercase();
+        }
+    }
+    if server.matches(':').count() == 1 {
+        if let Some((host, _)) = server.rsplit_once(':') {
+            return host.to_ascii_lowercase();
+        }
+    }
+    server.to_ascii_lowercase()
+}
+
+pub fn is_official_rustdesk_server(server: &str) -> bool {
+    let host = extract_server_host(server);
+    !host.is_empty() && (host == "rustdesk.com" || host.ends_with(".rustdesk.com"))
+}
+
+fn sanitize_server_address(server: &str) -> String {
+    let server = server.trim();
+    if server.is_empty() || is_official_rustdesk_server(server) {
+        return String::new();
+    }
+    server.to_owned()
+}
+
+fn sanitize_server_list<T: AsRef<str>, I: IntoIterator<Item = T>>(servers: I) -> Vec<String> {
+    let mut sanitized = Vec::new();
+    let mut seen = HashSet::new();
+    for server in servers {
+        let server = sanitize_server_address(server.as_ref());
+        if server.is_empty() {
+            continue;
+        }
+        if seen.insert(server.clone()) {
+            sanitized.push(server);
+        }
+    }
+    sanitized
+}
+
+fn sanitize_server_option_value(key: &str, value: &str) -> Option<String> {
+    match key {
+        keys::OPTION_CUSTOM_RENDEZVOUS_SERVER
+        | keys::OPTION_API_SERVER
+        | keys::OPTION_RELAY_SERVER => {
+            let sanitized = sanitize_server_address(value);
+            (!sanitized.is_empty()).then_some(sanitized)
+        }
+        keys::OPTION_RENDEZVOUS_SERVERS => {
+            let sanitized = sanitize_server_list(value.split(',')).join(",");
+            (!sanitized.is_empty()).then_some(sanitized)
+        }
+        _ => Some(value.to_owned()),
+    }
+}
+
+fn sanitize_server_options(options: &mut HashMap<String, String>) -> bool {
+    let mut changed = false;
+    for key in [
+        keys::OPTION_CUSTOM_RENDEZVOUS_SERVER,
+        keys::OPTION_API_SERVER,
+        keys::OPTION_RELAY_SERVER,
+        keys::OPTION_RENDEZVOUS_SERVERS,
+    ] {
+        let Some(raw) = options.get(key).cloned() else {
+            continue;
+        };
+        match sanitize_server_option_value(key, &raw) {
+            Some(sanitized) if sanitized == raw => {}
+            Some(sanitized) => {
+                options.insert(key.to_owned(), sanitized);
+                changed = true;
+            }
+            None => {
+                options.remove(key);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+pub fn sanitize_private_client_server_state() -> bool {
+    let mut runtime_changed = false;
+    {
+        let mut exe = EXE_RENDEZVOUS_SERVER.write().unwrap();
+        let sanitized = sanitize_server_address(&exe);
+        if *exe != sanitized {
+            *exe = sanitized;
+            runtime_changed = true;
+        }
+    }
+    {
+        let mut prod = PROD_RENDEZVOUS_SERVER.write().unwrap();
+        let sanitized = sanitize_server_address(&prod);
+        if *prod != sanitized {
+            *prod = sanitized;
+            runtime_changed = true;
+        }
+    }
+    let mut config = CONFIG2.write().unwrap();
+    let mut config_changed = false;
+    let sanitized_selected = sanitize_server_address(&config.rendezvous_server);
+    if config.rendezvous_server != sanitized_selected {
+        config.rendezvous_server = sanitized_selected;
+        config_changed = true;
+    }
+    if sanitize_server_options(&mut config.options) {
+        config_changed = true;
+    }
+    if config_changed {
+        config.store();
+    }
+    runtime_changed || config_changed
+}
+
 macro_rules! serde_field_string {
     ($default_func:ident, $de_func:ident, $default_expr:expr) => {
         fn $default_func() -> String {
@@ -848,15 +986,18 @@ impl Config {
     }
 
     pub fn get_rendezvous_server() -> String {
-        let mut rendezvous_server = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
+        let mut rendezvous_server =
+            sanitize_server_address(&EXE_RENDEZVOUS_SERVER.read().unwrap().clone());
         if rendezvous_server.is_empty() {
-            rendezvous_server = Self::get_option("custom-rendezvous-server");
+            rendezvous_server = Self::get_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER);
         }
         if rendezvous_server.is_empty() {
-            rendezvous_server = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
+            rendezvous_server =
+                sanitize_server_address(&PROD_RENDEZVOUS_SERVER.read().unwrap().clone());
         }
         if rendezvous_server.is_empty() {
-            rendezvous_server = CONFIG2.read().unwrap().rendezvous_server.clone();
+            rendezvous_server =
+                sanitize_server_address(&CONFIG2.read().unwrap().rendezvous_server.clone());
         }
         if rendezvous_server.is_empty() {
             rendezvous_server = Self::get_rendezvous_servers()
@@ -874,25 +1015,25 @@ impl Config {
     }
 
     pub fn get_rendezvous_servers() -> Vec<String> {
-        let s = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
+        let s = sanitize_server_address(&EXE_RENDEZVOUS_SERVER.read().unwrap().clone());
         if !s.is_empty() {
             return vec![s];
         }
-        let s = Self::get_option("custom-rendezvous-server");
+        let s = Self::get_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER);
         if !s.is_empty() {
             return vec![s];
         }
-        let s = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
+        let s = sanitize_server_address(&PROD_RENDEZVOUS_SERVER.read().unwrap().clone());
         if !s.is_empty() {
             return vec![s];
         }
         let serial_obsolute = CONFIG2.read().unwrap().serial > SERIAL;
         if serial_obsolute {
-            let ss: Vec<String> = Self::get_option("rendezvous-servers")
-                .split(',')
-                .filter(|x| x.contains('.'))
-                .map(|x| x.to_owned())
-                .collect();
+            let ss = sanitize_server_list(
+                Self::get_option(keys::OPTION_RENDEZVOUS_SERVERS)
+                    .split(',')
+                    .filter(|x| x.contains('.')),
+            );
             if !ss.is_empty() {
                 return ss;
             }
@@ -1164,6 +1305,7 @@ impl Config {
         let mut res = DEFAULT_SETTINGS.read().unwrap().clone();
         res.extend(CONFIG2.read().unwrap().options.clone());
         res.extend(OVERWRITE_SETTINGS.read().unwrap().clone());
+        sanitize_server_options(&mut res);
         res
     }
 
@@ -1173,6 +1315,7 @@ impl Config {
     }
 
     pub fn set_options(mut v: HashMap<String, String>) {
+        sanitize_server_options(&mut v);
         Self::purify_options(&mut v);
         let mut config = CONFIG2.write().unwrap();
         if config.options == v {
@@ -1183,13 +1326,14 @@ impl Config {
     }
 
     pub fn get_option(k: &str) -> String {
-        get_or(
+        let value = get_or(
             &OVERWRITE_SETTINGS,
             &CONFIG2.read().unwrap().options,
             &DEFAULT_SETTINGS,
             k,
         )
-        .unwrap_or_default()
+        .unwrap_or_default();
+        sanitize_server_option_value(k, &value).unwrap_or_default()
     }
 
     pub fn get_bool_option(k: &str) -> bool {
@@ -1197,7 +1341,8 @@ impl Config {
     }
 
     pub fn set_option(k: String, v: String) {
-        if !is_option_can_save(&OVERWRITE_SETTINGS, &k, &DEFAULT_SETTINGS, &v) {
+        let sanitized = sanitize_server_option_value(&k, &v).unwrap_or_default();
+        if !is_option_can_save(&OVERWRITE_SETTINGS, &k, &DEFAULT_SETTINGS, &sanitized) {
             let mut config = CONFIG2.write().unwrap();
             if config.options.remove(&k).is_some() {
                 config.store();
@@ -1205,12 +1350,16 @@ impl Config {
             return;
         }
         let mut config = CONFIG2.write().unwrap();
-        let v2 = if v.is_empty() { None } else { Some(&v) };
+        let v2 = if sanitized.is_empty() {
+            None
+        } else {
+            Some(&sanitized)
+        };
         if v2 != config.options.get(&k) {
             if v2.is_none() {
                 config.options.remove(&k);
             } else {
-                config.options.insert(k, v);
+                config.options.insert(k, sanitized);
             }
             config.store();
         }
@@ -2828,6 +2977,7 @@ pub mod keys {
     pub const OPTION_VERIFICATION_METHOD: &str = "verification-method";
     pub const OPTION_TEMPORARY_PASSWORD_LENGTH: &str = "temporary-password-length";
     pub const OPTION_CUSTOM_RENDEZVOUS_SERVER: &str = "custom-rendezvous-server";
+    pub const OPTION_RENDEZVOUS_SERVERS: &str = "rendezvous-servers";
     pub const OPTION_API_SERVER: &str = "api-server";
     pub const OPTION_KEY: &str = "key";
     pub const OPTION_ALLOW_WEBSOCKET: &str = "allow-websocket";
@@ -3515,6 +3665,94 @@ mod tests {
         RestoreRendezvousState::clear_all();
 
         assert_eq!(Config::get_rendezvous_server(), "");
+    }
+
+    #[test]
+    fn test_get_rendezvous_server_ignores_public_selected_config_server() {
+        let _restore = RestoreRendezvousState::capture();
+        RestoreRendezvousState::clear_all();
+        CONFIG2.write().unwrap().rendezvous_server = "rs-ny.rustdesk.com:21116".to_owned();
+
+        assert_eq!(Config::get_rendezvous_server(), "");
+    }
+
+    #[test]
+    fn test_get_rendezvous_servers_filters_public_persisted_servers() {
+        let _restore = RestoreRendezvousState::capture();
+        RestoreRendezvousState::clear_all();
+        let mut config2 = CONFIG2.write().unwrap();
+        config2.serial = SERIAL + 1;
+        config2.options.insert(
+            keys::OPTION_RENDEZVOUS_SERVERS.to_owned(),
+            "rs-ny.rustdesk.com:21116,private.example.com:21116".to_owned(),
+        );
+        drop(config2);
+
+        assert_eq!(
+            Config::get_rendezvous_servers(),
+            vec!["private.example.com:21116".to_owned()]
+        );
+    }
+
+    #[test]
+    fn test_set_option_rejects_public_server_values() {
+        let _restore = RestoreRendezvousState::capture();
+        RestoreRendezvousState::clear_all();
+
+        Config::set_option(
+            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_owned(),
+            "rs-ny.rustdesk.com:21116".to_owned(),
+        );
+        Config::set_option(
+            keys::OPTION_RENDEZVOUS_SERVERS.to_owned(),
+            "rs-ny.rustdesk.com:21116,private.example.com:21116".to_owned(),
+        );
+
+        assert_eq!(Config::get_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER), "");
+        assert_eq!(
+            Config::get_option(keys::OPTION_RENDEZVOUS_SERVERS),
+            "private.example.com:21116"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_private_client_server_state_clears_public_server_values() {
+        let _restore = RestoreRendezvousState::capture();
+        RestoreRendezvousState::clear_all();
+
+        *EXE_RENDEZVOUS_SERVER.write().unwrap() = "rs-ny.rustdesk.com:21116".to_owned();
+        *PROD_RENDEZVOUS_SERVER.write().unwrap() = "rs-sg.rustdesk.com:21116".to_owned();
+        let mut config2 = CONFIG2.write().unwrap();
+        config2.rendezvous_server = "rs-ny.rustdesk.com:21116".to_owned();
+        config2.options.insert(
+            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_owned(),
+            "rs-ny.rustdesk.com:21116".to_owned(),
+        );
+        config2.options.insert(
+            keys::OPTION_API_SERVER.to_owned(),
+            "https://admin.rustdesk.com".to_owned(),
+        );
+        config2.options.insert(
+            keys::OPTION_RELAY_SERVER.to_owned(),
+            "rs-ny.rustdesk.com:21117".to_owned(),
+        );
+        config2.options.insert(
+            keys::OPTION_RENDEZVOUS_SERVERS.to_owned(),
+            "rs-ny.rustdesk.com:21116,private.example.com:21116".to_owned(),
+        );
+        drop(config2);
+
+        assert!(sanitize_private_client_server_state());
+        assert_eq!(EXE_RENDEZVOUS_SERVER.read().unwrap().as_str(), "");
+        assert_eq!(PROD_RENDEZVOUS_SERVER.read().unwrap().as_str(), "");
+        assert_eq!(CONFIG2.read().unwrap().rendezvous_server.as_str(), "");
+        assert_eq!(Config::get_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER), "");
+        assert_eq!(Config::get_option(keys::OPTION_API_SERVER), "");
+        assert_eq!(Config::get_option(keys::OPTION_RELAY_SERVER), "");
+        assert_eq!(
+            Config::get_option(keys::OPTION_RENDEZVOUS_SERVERS),
+            "private.example.com:21116"
+        );
     }
 
     #[test]
