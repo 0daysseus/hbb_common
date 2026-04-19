@@ -156,7 +156,7 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];
+pub const RENDEZVOUS_SERVERS: &[&str] = &[];
 pub const RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
@@ -863,6 +863,9 @@ impl Config {
                 .drain(..)
                 .next()
                 .unwrap_or_default();
+        }
+        if rendezvous_server.is_empty() {
+            return rendezvous_server;
         }
         if !rendezvous_server.contains(':') {
             rendezvous_server = format!("{rendezvous_server}:{RENDEZVOUS_PORT}");
@@ -3164,6 +3167,55 @@ impl Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    struct RestoreRendezvousState {
+        exe: String,
+        prod: String,
+        config2_rendezvous_server: String,
+        config2_serial: i32,
+        config2_options: HashMap<String, String>,
+        custom_option: String,
+    }
+
+    impl RestoreRendezvousState {
+        fn capture() -> Self {
+            let config2 = CONFIG2.read().unwrap();
+            Self {
+                exe: EXE_RENDEZVOUS_SERVER.read().unwrap().clone(),
+                prod: PROD_RENDEZVOUS_SERVER.read().unwrap().clone(),
+                config2_rendezvous_server: config2.rendezvous_server.clone(),
+                config2_serial: config2.serial,
+                config2_options: config2.options.clone(),
+                custom_option: Config::get_option("custom-rendezvous-server"),
+            }
+        }
+
+        fn clear_all() {
+            *EXE_RENDEZVOUS_SERVER.write().unwrap() = String::new();
+            *PROD_RENDEZVOUS_SERVER.write().unwrap() = String::new();
+            Config::set_option("custom-rendezvous-server".to_owned(), String::new());
+            let mut config2 = CONFIG2.write().unwrap();
+            config2.rendezvous_server.clear();
+            config2.serial = SERIAL;
+            config2.options.remove("rendezvous-servers");
+        }
+    }
+
+    impl Drop for RestoreRendezvousState {
+        fn drop(&mut self) {
+            *EXE_RENDEZVOUS_SERVER.write().unwrap() = self.exe.clone();
+            *PROD_RENDEZVOUS_SERVER.write().unwrap() = self.prod.clone();
+            Config::set_option(
+                "custom-rendezvous-server".to_owned(),
+                self.custom_option.clone(),
+            );
+            let mut config2 = CONFIG2.write().unwrap();
+            config2.rendezvous_server = self.config2_rendezvous_server.clone();
+            config2.serial = self.config2_serial;
+            config2.options = self.config2_options.clone();
+        }
+    }
 
     #[test]
     fn test_serialize() {
@@ -3447,6 +3499,22 @@ mod tests {
             let cfg = toml::from_str::<PeerConfig>(wrong_field_str);
             assert_eq!(cfg, Ok(cfg_to_compare), "Failed to test wrong_field_str");
         }
+    }
+
+    #[test]
+    fn test_get_rendezvous_servers_is_empty_without_private_configuration() {
+        let _restore = RestoreRendezvousState::capture();
+        RestoreRendezvousState::clear_all();
+
+        assert!(Config::get_rendezvous_servers().is_empty());
+    }
+
+    #[test]
+    fn test_get_rendezvous_server_is_empty_without_private_configuration() {
+        let _restore = RestoreRendezvousState::capture();
+        RestoreRendezvousState::clear_all();
+
+        assert_eq!(Config::get_rendezvous_server(), "");
     }
 
     #[test]
